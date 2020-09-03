@@ -29,9 +29,12 @@ import static org.camunda.bpm.engine.impl.telemetry.TelemetryRegistry.EXECUTED_D
 import static org.camunda.bpm.engine.impl.telemetry.TelemetryRegistry.FLOW_NODE_INSTANCES;
 import static org.camunda.bpm.engine.impl.telemetry.TelemetryRegistry.ROOT_PROCESS_INSTANCES;
 import static org.camunda.bpm.engine.impl.telemetry.TelemetryRegistry.UNIQUE_TASK_WORKERS;
+import static org.junit.Assert.fail;
 
 import java.net.HttpURLConnection;
+import java.util.Calendar;
 import java.util.Collection;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -44,6 +47,7 @@ import org.camunda.bpm.engine.RuntimeService;
 import org.camunda.bpm.engine.TaskService;
 import org.camunda.bpm.engine.impl.cfg.ProcessEngineConfigurationImpl;
 import org.camunda.bpm.engine.impl.cfg.StandaloneInMemProcessEngineConfiguration;
+import org.camunda.bpm.engine.impl.history.HistoryLevel;
 import org.camunda.bpm.engine.impl.metrics.Meter;
 import org.camunda.bpm.engine.impl.telemetry.TelemetryRegistry;
 import org.camunda.bpm.engine.impl.telemetry.dto.ApplicationServer;
@@ -54,6 +58,7 @@ import org.camunda.bpm.engine.impl.telemetry.dto.Internals;
 import org.camunda.bpm.engine.impl.telemetry.dto.Metric;
 import org.camunda.bpm.engine.impl.telemetry.dto.Product;
 import org.camunda.bpm.engine.impl.telemetry.reporter.TelemetryReporter;
+import org.camunda.bpm.engine.impl.util.ClockUtil;
 import org.camunda.bpm.engine.test.Deployment;
 import org.camunda.bpm.engine.test.ProcessEngineRule;
 import org.camunda.bpm.engine.test.RequiredHistoryLevel;
@@ -121,6 +126,7 @@ public class TelemetryReporterTest {
 
   @After
   public void tearDown() {
+    ClockUtil.resetClock();
     managementService.toggleTelemetry(false);
 
     clearMetrics();
@@ -136,7 +142,6 @@ public class TelemetryReporterTest {
         .enableFeelLegacyBehavior(false)
         .init();
   }
-
 
   protected void clearMetrics() {
     Collection<Meter> meters = configuration.getMetricsRegistry().getMeters().values();
@@ -245,13 +250,33 @@ public class TelemetryReporterTest {
     verify(postRequestedFor(urlEqualTo(TELEMETRY_ENDPOINT_PATH))
         .withRequestBody(equalToJson(requestBody))
         .withHeader("Content-Type",  equalTo("application/json")));
-    assertThat(configuration.getTelemetryRegistry().getCommands().size()).isEqualTo(3);
+    if (configuration.getHistoryLevel().getId() >= HistoryLevel.HISTORY_LEVEL_ACTIVITY.getId()) {
+      assertThat(configuration.getTelemetryRegistry().getCommands().size()).isEqualTo(3);
+    } else if (configuration.getHistoryLevel().getId() >= HistoryLevel.HISTORY_LEVEL_NONE.getId()) {
+      assertThat(configuration.getTelemetryRegistry().getCommands().size()).isEqualTo(2);
+    } else {
+      fail("Unexpected history level.");
+    }
+  }
+
+  @Test
+  @Deployment(resources = { "org/camunda/bpm/engine/test/api/oneTaskProcess.bpmn20.xml" })
+  public void shouldSetStartReportTimeWhenTelemetryEnabled() {
+    // given
+    Date currentTime = ClockUtil.getCurrentTime();
+
+    // when
+    managementService.toggleTelemetry(true);
+
+    // then
+    assertThat(configuration.getTelemetryRegistry().getStartReportTime()).isInSameSecondWindowAs(currentTime);
+
   }
 
   @Test
   @Deployment(resources = { "org/camunda/bpm/engine/test/api/oneTaskProcess.bpmn20.xml" })
   public void shouldSendTelemetryWithRooProcessInstanceMetrics() {
-    // given default telemetry data
+    // given
     managementService.toggleTelemetry(true);
     for (int i = 0; i < 3; i++) {
       runtimeService.startProcessInstanceByKey("oneTaskProcess");
@@ -277,12 +302,49 @@ public class TelemetryReporterTest {
     assertThat(metrics.get(ROOT_PROCESS_INSTANCES).getCount()).isEqualTo(3);
   }
 
+
+  @Test
+  @Deployment(resources = { "org/camunda/bpm/engine/test/api/oneTaskProcess.bpmn20.xml" })
+  public void shouldSendTelemetryOnceWithRooProcessInstanceMetrics() {
+    // given
+    managementService.toggleTelemetry(false);
+    for (int i = 0; i < 3; i++) {
+      runtimeService.startProcessInstanceByKey("oneTaskProcess");
+    }
+    configuration.getDbMetricsReporter().reportNow();
+    ClockUtil.setCurrentTime(addHour(new Date()));
+    managementService.toggleTelemetry(true);
+    for (int i = 0; i < 3; i++) {
+      runtimeService.startProcessInstanceByKey("oneTaskProcess");
+    }
+    configuration.getDbMetricsReporter().reportNow();
+    ClockUtil.setCurrentTime(addHour(new Date()));
+
+    Data expectedData = adjustDataWithMetricCounts(configuration.getTelemetryData(), 3, 0, 6, 0);
+
+    String requestBody = new Gson().toJson(expectedData);
+    stubFor(post(urlEqualTo(TELEMETRY_ENDPOINT_PATH))
+        .willReturn(aResponse()
+            .withBody(requestBody)
+            .withStatus(HttpURLConnection.HTTP_ACCEPTED)));
+
+    // when
+    configuration.getTelemetryReporter().reportNow();
+
+    // then
+    verify(postRequestedFor(urlEqualTo(TELEMETRY_ENDPOINT_PATH))
+        .withRequestBody(equalToJson(requestBody))
+        .withHeader("Content-Type",  equalTo("application/json")));
+    Map<String, Metric> metrics = configuration.getTelemetryData().getProduct().getInternals().getMetrics();
+    assertThat(metrics.get(ROOT_PROCESS_INSTANCES).getCount()).isEqualTo(3);
+  }
+
   @Test
   @Deployment(resources = {
       "org/camunda/bpm/engine/test/dmn/businessruletask/DmnBusinessRuleTaskTest.testDecisionRef.bpmn20.xml",
       "org/camunda/bpm/engine/test/dmn/businessruletask/DmnBusinessRuleTaskTest.testDecisionOkay.dmn11.xml" })
   public void shouldSendTelemetryWithExecutedDecisionInstanceMetrics() {
-    // given default telemetry data
+    // given
     managementService.toggleTelemetry(true);
     for (int i = 0; i < 2; i++) {
       runtimeService.startProcessInstanceByKey("testProcess");
@@ -310,7 +372,7 @@ public class TelemetryReporterTest {
   @Test
   @Deployment(resources = "org/camunda/bpm/engine/test/api/oneTaskProcess.bpmn20.xml")
   public void shouldSendTelemetryWithFlowNodeInstanceMetrics() {
-    // given default telemetry data
+    // given
     managementService.toggleTelemetry(true);
     for (int i = 0; i < 4; i++) {
       runtimeService.startProcessInstanceByKey("oneTaskProcess");
@@ -341,7 +403,7 @@ public class TelemetryReporterTest {
   @RequiredHistoryLevel(ProcessEngineConfiguration.HISTORY_ACTIVITY)
   @Deployment(resources = "org/camunda/bpm/engine/test/api/oneTaskProcess.bpmn20.xml")
   public void shouldSendTelemetryWithTaskWorkersMetrics() {
-    // given default telemetry data
+    // given
     managementService.toggleTelemetry(true);
     for (int i = 0; i < 3; i++) {
       String processInstanceId = runtimeService.startProcessInstanceByKey("oneTaskProcess").getId();
@@ -526,6 +588,14 @@ public class TelemetryReporterTest {
     metrics.put(FLOW_NODE_INSTANCES, new Metric(flowNodeCount));
     metrics.put(UNIQUE_TASK_WORKERS, new Metric(workerCount));
     return metrics;
+  }
+
+  protected Date addHour(Date date) {
+    Calendar calendar = Calendar.getInstance();
+    calendar.setTime(date);
+    calendar.add(Calendar.HOUR_OF_DAY, 1);
+    Date newDate = calendar.getTime();
+    return newDate;
   }
 
 }
